@@ -11,6 +11,7 @@ int pixelflut_init(pixelflut_t *pixelflut, unsigned int canvas_width, unsigned i
 	if (err) {
 		return err;
 	}
+	pixelflut->fb = fb;
 
 	net_init(&pixelflut->net, fb, &fb->size, buffer_size);
 
