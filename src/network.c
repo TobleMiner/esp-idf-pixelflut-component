@@ -67,25 +67,53 @@ void net_init(struct net* net, struct fb* fb, struct fb_size* fb_size, size_t pf
 	net->pfring_size = pfring_size;
 }
 
+static void net_connection_thread_cleanup_socket(struct net_connection_thread *thread) {
+	shutdown(thread->threadargs.socket, SHUT_RDWR);
+	close(thread->threadargs.socket);
+}
+
+static void net_connection_thread_cleanup_self(struct net_connection_thread *thread) {
+	pthread_mutex_lock(&thread->threadargs.net_thread->list_lock);
+	llist_remove(&thread->list);
+	thread->threadargs.net_thread->num_connections--;
+	pthread_mutex_unlock(&thread->threadargs.net_thread->list_lock);
+	free(thread);
+}
+
 static void net_listen_thread_cleanup_threadlist(struct net_thread *thread) {
 	struct llist* threadlist = &thread->threadlist;
 	struct net_connection_thread* conn_thread;
+	struct net *net = container_of(thread, struct net, listen_thread);
+	struct llist_entry *cursor, *next;
+
+	net->exit_notification_task = xTaskGetCurrentTaskHandle();
 
 	llist_lock(threadlist);
-	while(threadlist->head) {
+	llist_for_each(threadlist, cursor) {
+		conn_thread = llist_entry_get_value(cursor, struct net_connection_thread, list);
+		conn_thread->do_exit = 1;
+	}
+	llist_for_each_safe(threadlist, cursor, next) {
 		conn_thread = llist_entry_get_value(threadlist->head, struct net_connection_thread, list);
-		pthread_cancel(conn_thread->thread);
 		llist_unlock(threadlist)
-		pthread_join(conn_thread->thread, NULL);
+		do {
+			ulTaskNotifyTake(0, pdMS_TO_TICKS(100));
+		} while (!conn_thread->has_terminated);
 		llist_lock(threadlist);
+		vTaskDelete(conn_thread->thread);
+		net_connection_thread_cleanup_self(conn_thread);
 	}
 	llist_unlock(threadlist);
 }
 
 static void net_kill_threads(struct net* net) {
 	net->state = NET_STATE_SHUTDOWN;
-	pthread_cancel(net->listen_thread.thread);
-	pthread_join(net->listen_thread.thread, NULL);
+	net->exit_notification_task = xTaskGetCurrentTaskHandle();
+	net->listen_thread.do_exit = 1;
+	do {
+		ulTaskNotifyTake(0, pdMS_TO_TICKS(100));
+	} while (!net->listen_thread.has_terminated);
+	vTaskDelete(net->listen_thread.thread);
 	net_listen_thread_cleanup_threadlist(&net->listen_thread);
 }
 
@@ -213,19 +241,7 @@ out:
 	return ret;
 }
 
-static void net_connection_thread_cleanup_socket(struct net_connection_thread *thread) {
-	shutdown(thread->threadargs.socket, SHUT_RDWR);
-	close(thread->threadargs.socket);
-}
-
-static void net_connection_thread_cleanup_self(struct net_connection_thread *thread) {
-	pthread_mutex_lock(&thread->threadargs.net_thread->list_lock);
-	llist_remove(&thread->list);
-	pthread_mutex_unlock(&thread->threadargs.net_thread->list_lock);
-	free(thread);
-}
-
-static void* net_connection_thread(void* args) {
+static void net_connection_thread(void* args) {
 	struct net_connection_threadargs* threadargs = args;
 	int err, socket = threadargs->socket;
 	struct net* net = threadargs->net;
@@ -272,12 +288,19 @@ static void* net_connection_thread(void* args) {
 
 	pfring_init(ring, thread->pfring_data, net->pfring_size);
 recv:
-	while(net->state != NET_STATE_SHUTDOWN) {
+	while(1) {
 		read_len = read(socket, ring->ptr_write, pfring_free_space_contig(ring));
+		if (thread->do_exit) {
+			goto fail_ring;
+		}
 		if(read_len <= 0) {
 			if(read_len < 0) {
 				err = -errno;
-				fprintf(stderr, "Client socket failed %d => %s\n", errno, strerror(errno));
+				if (err == -EAGAIN) {
+					goto recv;
+				}
+
+				fprintf(stderr, "Client socket failed %d, %d => %s\n", read_len, errno, strerror(errno));
 			}
 			goto fail_ring;
 		}
@@ -406,17 +429,21 @@ recv:
 fail_ring:
 //fail_socket:
 	net_connection_thread_cleanup_socket(thread);
-	net_connection_thread_cleanup_self(thread);
-//fail:
-	pthread_detach(pthread_self());
-	return NULL;
+	if (!thread->do_exit) {
+		net_connection_thread_cleanup_self(thread);
+	} else {
+		thread->has_terminated = true;
+		xTaskNotifyGive(net->exit_notification_task);
+	}
+	vTaskSuspend(NULL);
+	return;
 
 recv_more:
 	ring->ptr_read = last_cmd;
 	goto recv;
 }
 
-static void* net_listen_thread(void* args) {
+static void net_listen_thread(void* args) {
 	int err, socket;
 	struct net* net = args;
 	struct net_thread* thread = &net->listen_thread;
@@ -428,14 +455,38 @@ static void* net_listen_thread(void* args) {
 	llist_init(threadlist);
 	thread->initialized = true;
 
-	while(net->state != NET_STATE_SHUTDOWN) {
+	while(1) {
+		char thread_name[17] = { 0 };
+		struct timeval rx_timeout = {
+			.tv_sec = 0,
+			.tv_usec = 100000,
+		};
+		struct pollfd poll_main = {
+			.fd = net->socket,
+			.events = POLLIN,
+		};
+
+		err = poll(&poll_main, 1, 100);
+		if (!err) {
+			continue;
+		}
+		if (err < 0) {
+			fprintf(stderr, "Failed to poll %d => %s, shutting down\n", errno, strerror(errno));
+			goto fail_threadlist;
+		}
+
 		socket = accept(net->socket, NULL, NULL);
 		if(socket < 0) {
 			err = -errno;
 			fprintf(stderr, "Got error %d => %s, shutting down\n", errno, strerror(errno));
 			goto fail_threadlist;
 		}
-		printf("Got a new connection\n");
+
+		err = setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &rx_timeout, sizeof(rx_timeout));
+		if (err) {
+			fprintf(stderr, "Failed to set socket recieve timeout\n");
+			goto fail_connection;
+		}
 
 		conn_thread = calloc(1, sizeof(struct net_connection_thread) + net->pfring_size);
 		if(!conn_thread) {
@@ -448,13 +499,16 @@ static void* net_listen_thread(void* args) {
 		conn_thread->threadargs.net_thread = thread;
 
 		pthread_mutex_lock(&thread->list_lock);
-		if((err = -pthread_create(&conn_thread->thread, NULL, net_connection_thread, &conn_thread->threadargs))) {
-			fprintf(stderr, "Failed to create thread: %d => %s\n", err, strerror(-err));
+		snprintf(thread_name, sizeof(thread_name), "pixelflut_net%u", thread->num_connections + 1);
+		err = (xTaskCreate(net_connection_thread, thread_name, 2024, &conn_thread->threadargs, 0, &conn_thread->thread) != pdPASS);
+		if(err) {
+			fprintf(stderr, "Failed to create thread: %d\n", err);
 			pthread_mutex_unlock(&thread->list_lock);
 			goto fail_thread_entry;
 		}
 
 		llist_append(threadlist, &conn_thread->list);
+		thread->num_connections++;
 		pthread_mutex_unlock(&thread->list_lock);
 
 		continue;
@@ -467,9 +521,11 @@ fail_connection:
 	}
 fail_threadlist:
 	net_listen_thread_cleanup_threadlist(thread);
-//fail:
-	return NULL;
-
+	thread->has_terminated = true;
+	if (thread->do_exit) {
+		xTaskNotifyGive(net->exit_notification_task);
+	}
+	vTaskSuspend(NULL);
 }
 
 int net_listen(struct net* net, struct sockaddr_storage* addr, size_t addr_len) {
@@ -488,6 +544,7 @@ int net_listen(struct net* net, struct sockaddr_storage* addr, size_t addr_len) 
 		err = -errno;
 		goto fail;
 	}
+
 	setsockopt(net->socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int));
 
 	host_str = inet_ntop(addr->ss_family, addr, host_tmp, sizeof(host_tmp));
@@ -524,9 +581,9 @@ int net_listen(struct net* net, struct sockaddr_storage* addr, size_t addr_len) 
 
 	// Setup listen thread
 	do {
-		err = -pthread_create(&net->listen_thread.thread, NULL, net_listen_thread, net);
+		err = (xTaskCreate(net_listen_thread, "pixelflut_acpt", 2048, net, 0, &net->listen_thread.thread) != pdPASS);
 		if(err) {
-			fprintf(stderr, "Failed to create listen pthread\n");
+			fprintf(stderr, "Failed to create listen task: %d\n", err);
 			goto fail_pthread_create;
 		}
 	} while (0);

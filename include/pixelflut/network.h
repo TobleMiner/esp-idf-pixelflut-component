@@ -6,6 +6,9 @@
 #include <sys/socket.h>
 #include <stdbool.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 struct net;
 
 #include "framebuffer.h"
@@ -20,11 +23,14 @@ enum {
 };
 
 struct net_thread {
-	pthread_t thread;
+	TaskHandle_t thread;
 	bool initialized;
 	pthread_mutex_t list_lock;
+	unsigned int num_connections;
 
 	struct llist threadlist;
+	bool do_exit;
+	bool has_terminated;
 };
 
 struct net {
@@ -39,6 +45,7 @@ struct net {
 	unsigned int num_threads;
 	struct net_thread listen_thread;
 	struct fb_size* fb_size;
+	TaskHandle_t exit_notification_task;
 };
 
 struct net_connection_threadargs {
@@ -48,7 +55,7 @@ struct net_connection_threadargs {
 };
 
 struct net_connection_thread {
-	pthread_t thread;
+	TaskHandle_t thread;
 	struct llist_entry list;
 	struct net_connection_threadargs threadargs;
 	struct {
@@ -56,6 +63,8 @@ struct net_connection_thread {
 		unsigned int y;
 	} offset;
 	uint32_t byte_count;
+	bool do_exit;
+	bool has_terminated;
 
 	struct ring ring;
 
