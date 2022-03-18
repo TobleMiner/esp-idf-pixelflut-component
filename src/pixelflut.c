@@ -34,3 +34,13 @@ int pixelflut_listen(pixelflut_t *pixelflut) {
 			  (struct sockaddr_storage *)&listen_address,
 			  sizeof(listen_address));
 }
+
+unsigned int pixelflut_get_num_connections(pixelflut_t *pixelflut) {
+	unsigned int num_connections;
+
+	pthread_mutex_lock(&pixelflut->net.listen_thread.list_lock);
+	num_connections = pixelflut->net.listen_thread.num_connections;
+	pthread_mutex_unlock(&pixelflut->net.listen_thread.list_lock);
+
+	return num_connections;
+}
